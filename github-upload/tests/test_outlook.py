@@ -1,5 +1,7 @@
 import asyncio
 import unittest
+import tempfile
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
@@ -14,6 +16,14 @@ def model():
             'peaks':[{'time_utc':(NOW+timedelta(hours=h)).isoformat(), 'mllw_ft':15.4} for h in (12,36,60,72)]}
 
 class OutlookTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        cache = patch.object(sources, 'CACHE_DIR', Path(directory.name))
+        cache.start(); self.addCleanup(cache.stop)
+        outlook._feed_cache = {}
+        outlook._feed_lock = asyncio.Lock()
+
     def test_pressure_boundaries(self):
         for value, expected in [(984.9,'Extremely'),(985,'Very'),(994.9,'Very'),(995,'Low'),(1004.9,'Low'),(1005,'Normal')]:
             self.assertTrue(outlook.pressure_label(value).startswith(expected))
@@ -57,7 +67,7 @@ class OutlookTests(unittest.TestCase):
         with self.assertRaises(ValueError): outlook.parse_atmosphere(p)
 
     def test_provider_failure(self):
-        with patch.object(sources,'get',AsyncMock(side_effect=sources.httpx.ConnectError('offline'))):
+        with patch.object(sources,'get',AsyncMock(side_effect=sources.httpx.ConnectError('offline'))), patch.object(outlook,'fetch_metno',AsyncMock(side_effect=sources.httpx.ConnectError('offline'))):
             self.assertFalse(asyncio.run(outlook.atmospheric_forecast())['available'])
 
     def test_rainfall_outlook_time_and_missing_coverage(self):
