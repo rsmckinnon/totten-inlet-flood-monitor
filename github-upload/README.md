@@ -41,9 +41,12 @@ pressure-derived height, extrapolated SSCOFS height, or synthetic surge is used.
 Atmospheric context comes from NOAA GFS/HRRR through
 [Open-Meteo's GFS API](https://open-meteo.com/en/docs/gfs-api), using the configured
 property coordinates, sea-level pressure (`pressure_msl`, hPa = mb), and 10 m wind
-speed/direction (mph and degrees from north). The nearest hourly forecast within
-30 minutes is displayed; missing values and times beyond atmospheric coverage
-remain unavailable. Retrieval time is shown separately from model issuance.
+speed/direction (mph and degrees from north). Open-Meteo uses the nearest hourly forecast within 30 minutes.
+If that service fails, MET Norway Locationforecast supplies an independent
+fallback using the nearest actual forecast sample within three hours (later
+forecasts are six-hourly). The displayed sample time identifies this offset.
+No atmospheric interpolation or extrapolation is performed; missing values
+and times beyond atmospheric coverage remain unavailable. Retrieval time is shown separately from model issuance.
 Forecast uncertainty increases with lead time. NWS remains the rainfall source.
 A failure of the atmospheric service does not suppress tide or SSCOFS rows.
 
@@ -80,3 +83,22 @@ risk invariance. No new Python dependencies are required.
 For manual updates, replace each supplied file in full; no line-by-line edits
 are needed. Keep `.env`, the existing virtual environment, and NOAA cache files.
 Restart the server if it is not running with automatic reload.
+
+
+## Atmospheric provider resilience
+
+Open-Meteo can return HTTP 429 on a hosted server. The app backs off for at
+least one hour (longer when Retry-After requires it), then uses the independent
+[MET Norway Locationforecast](https://api.met.no/doc/locationforecast/datamodel)
+feed. MET Norway supplies sea-level pressure in hPa and wind in m/s; wind is
+converted to mph. Technical details identify the active source, and rows show
+the atmospheric sample time. This context never changes SSCOFS heights or risk.
+Data attribution: MET Norway and Open-Meteo, [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+
+Successful responses and failures are cached for at least one hour. Provider
+Expires headers and Retry-After are respected, concurrent visitors share a
+refresh, and MET Norway uses If-Modified-Since when revalidating. Cache entries
+are scoped to coordinates and atomically saved under `.cache`. A persistent
+disk retains them across restarts; without one, the process still caches in
+memory. Run one Uvicorn worker as in the existing Render start command.
+Expired forecasts are not silently served on errors. No API key is required.
