@@ -459,7 +459,12 @@ summary {
         72 hours; incomplete coverage is shown as unavailable.
     </p>
     <p class="muted note">
-        Atmospheric data: <a href="https://open-meteo.com/en/docs/gfs-api">NOAA GFS/HRRR via Open-Meteo</a>.
+        Atmospheric data: <a href="https://open-meteo.com/en/docs/gfs-api">NOAA GFS/HRRR via Open-Meteo</a>,
+        with <a href="https://api.met.no/doc/locationforecast/datamodel">MET Norway Locationforecast</a>
+        as an independent fallback. Forecast data are shared under
+        <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>.
+        We convert wind to mph and select the nearest forecast sample without interpolation.
+        Atmospheric forecasts are cached for at least one hour.
         Wind direction is where wind comes from, at 10 m above ground.
         Pressure labels are application categories, not NOAA warnings:
         normal / modestly low ≥1005 mb; low 995–&lt;1005 mb;
@@ -761,8 +766,10 @@ async function load() {
     ).then(x => x.json());
 
     document.getElementById('atmosphere-status').textContent = d.atmosphere.available
-        ? 'Atmospheric forecast retrieved ' + localTime(d.atmosphere.retrieved_at_utc) +
-          '. Context uses the nearest forecast hour (within 30 minutes).'
+        ? d.atmosphere.source + ' · retrieved ' + localTime(d.atmosphere.retrieved_at_utc) +
+          '. Nearest forecast sample: within ' +
+          (d.atmosphere.nearest_tolerance_seconds === 10800 ? '3 hours' : '30 minutes') +
+          '. Sample times appear below pressure values.'
         : 'Atmospheric forecast unavailable; tide and SSCOFS information remain available.';
     const r = d.risk;
 
@@ -946,7 +953,8 @@ async function load() {
                                     event.preceding_72h_rain_in
                                 )}
                             </td>
-                            <td>${escapeText(event.pressure_label)}${event.pressure_mb == null ? '' : ' · ' + event.pressure_mb + ' mb'}</td>
+                            <td>${escapeText(event.pressure_label)}${event.pressure_mb == null ? '' : ' · ' + event.pressure_mb + ' mb'}<br>
+                                <span class="muted note">${event.atmosphere_time_utc ? localTime(event.atmosphere_time_utc) : ''}</span></td>
                             <td>${escapeText(event.wind_text)}</td>
 
                         </tr>

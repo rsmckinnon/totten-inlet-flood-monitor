@@ -1,4 +1,7 @@
 """Atmospheric context and seven-day tide outlooks; never a water-level model."""
+import asyncio
+import copy
+from email.utils import parsedate_to_datetime
 import json
 import math
 from datetime import datetime, timedelta, timezone
@@ -64,18 +67,148 @@ def parse_atmosphere(payload):
     return sorted(rows, key=lambda row: row['time_utc'])
 
 
-async def atmospheric_forecast():
+METNO_URL = 'https://api.met.no/weatherapi/locationforecast/2.0/compact'
+METNO_AGENT = 'TottenInletFloodMonitor/1.0 https://github.com/rsmckinnon/totten-inlet-flood-monitor'
+_feed_lock = asyncio.Lock()
+_feed_cache = {}
+
+
+def http_time(value):
     try:
-        response = await sources.get(ATMOSPHERE_URL, params={
-            'latitude': config.PROPERTY_LAT, 'longitude': config.PROPERTY_LON,
-            'hourly': 'pressure_msl,wind_speed_10m,wind_direction_10m',
-            'wind_speed_unit': 'mph', 'timezone': 'GMT', 'forecast_days': 8,
-        })
-        rows = parse_atmosphere(response.json())
-        return {'available': bool(rows), 'source': 'NOAA GFS/HRRR via Open-Meteo',
-                'retrieved_at_utc': datetime.now(timezone.utc).isoformat(), 'hourly': rows}
-    except (sources.httpx.HTTPError, ValueError, TypeError, AttributeError) as exc:
-        return {'available': False, 'reason': str(exc), 'hourly': []}
+        return parsedate_to_datetime(value).astimezone(timezone.utc).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def parse_metno(payload):
+    properties = payload['properties']
+    units = properties['meta']['units']
+    expected = {'air_pressure_at_sea_level': 'hPa', 'wind_speed': 'm/s',
+                'wind_from_direction': 'degrees'}
+    if any(units.get(k) != v for k, v in expected.items()):
+        raise ValueError('Unexpected MET Norway units')
+    rows = []
+    for item in properties.get('timeseries', []):
+        time = utc(item.get('time'))
+        if time is None:
+            continue
+        details = item.get('data', {}).get('instant', {}).get('details', {})
+        pressure = finite(details.get('air_pressure_at_sea_level'))
+        speed = finite(details.get('wind_speed'))
+        direction = finite(details.get('wind_from_direction'))
+        rows.append({'time_utc': time.isoformat(),
+                     'pressure_msl': pressure if pressure is not None and 800 <= pressure <= 1100 else None,
+                     'wind_speed_10m': speed * 2.2369362921 if speed is not None and speed >= 0 else None,
+                     'wind_direction_10m': direction if direction is not None and 0 <= direction <= 360 else None})
+    return sorted(rows, key=lambda row: row['time_utc'])
+
+
+async def fetch_metno(params, last_modified=None):
+    headers = {'User-Agent': METNO_AGENT}
+    if last_modified:
+        headers['If-Modified-Since'] = last_modified
+    async with sources.httpx.AsyncClient(timeout=20, follow_redirects=True, headers=headers) as client:
+        response = await client.get(METNO_URL, params=params)
+        if response.status_code != 304:
+            response.raise_for_status()
+        return response
+
+
+def cache_file(key):
+    return sources.CACHE_DIR / f'atmosphere-v2-{key[0]}-{key[1]}.json'
+
+
+def save_cache(key, entries):
+    # Atomic replacement keeps interrupted writes from corrupting the cache.
+    try:
+        path = cache_file(key)
+        temporary = path.with_suffix('.tmp')
+        temporary.write_text(json.dumps(entries, allow_nan=False))
+        temporary.replace(path)
+    except OSError:
+        pass  # In-memory cache still protects the providers on read-only storage.
+
+
+async def atmospheric_forecast():
+    """Cache successes and failures; use an independent provider on outage.
+
+    One server worker performs the refresh; concurrent visitors reuse it.
+    Provider expiry/Retry-After headers take precedence over our minimum TTLs.
+    Expired data are never silently served as fresh forecasts.
+    """
+    key = (f'{config.PROPERTY_LAT:.4f}', f'{config.PROPERTY_LON:.4f}')
+    async with _feed_lock:
+        now = datetime.now(timezone.utc)
+        stamp = now.timestamp()
+        if key not in _feed_cache:
+            try:
+                loaded = json.loads(cache_file(key).read_text())
+                _feed_cache[key] = loaded if isinstance(loaded, dict) else {}
+            except (OSError, ValueError):
+                _feed_cache[key] = {}
+        entries = _feed_cache[key]
+        errors = []
+        for provider in ('open_meteo', 'met_norway'):
+            entry = entries.get(provider, {})
+            if entry.get('retry_at', 0) > stamp:
+                data = entry.get('data')
+                if data and data.get('available'):
+                    return copy.deepcopy(data)
+                errors.append(entry.get('reason', provider + ' temporarily unavailable'))
+                continue
+            response = None
+            try:
+                if provider == 'open_meteo':
+                    response = await sources.get(ATMOSPHERE_URL, params={
+                        'latitude': config.PROPERTY_LAT, 'longitude': config.PROPERTY_LON,
+                        'hourly': 'pressure_msl,wind_speed_10m,wind_direction_10m',
+                        'wind_speed_unit': 'mph', 'timezone': 'GMT', 'forecast_days': 8,
+                    })
+                    rows = parse_atmosphere(response.json())
+                    data = {'source': 'NOAA GFS/HRRR via Open-Meteo',
+                            'nearest_tolerance_seconds': 1800}
+                else:
+                    response = await fetch_metno({'lat': key[0], 'lon': key[1]}, entry.get('last_modified'))
+                    if response.status_code == 304:
+                        data = copy.deepcopy(entry.get('data') or entry.get('previous_data'))
+                        if not data:
+                            raise ValueError('MET Norway returned 304 without a cached forecast')
+                        rows = data['hourly']
+                    else:
+                        payload = response.json()
+                        rows = parse_metno(payload)
+                        data = {'source': 'MET Norway Locationforecast (fallback)',
+                                'model_updated_at_utc': payload['properties']['meta'].get('updated_at'),
+                                'nearest_tolerance_seconds': 10800}
+                if not any(utc(row['time_utc']) >= now and
+                           (row.get('pressure_msl') is not None or row.get('wind_speed_10m') is not None)
+                           for row in rows):
+                    raise ValueError('No usable future atmospheric forecast values')
+                data.update(available=True, hourly=rows, retrieved_at_utc=now.isoformat())
+                if response.status_code == 304:
+                    data['retrieved_at_utc'] = (entry.get('data') or entry['previous_data'])['retrieved_at_utc']
+                    data['checked_at_utc'] = now.isoformat()
+                entries[provider] = {'data': data,
+                    'retry_at': max(stamp + 3600, http_time(response.headers.get('Expires'))),
+                    'last_modified': response.headers.get('Last-Modified') or entry.get('last_modified')}
+                save_cache(key, entries)
+                return copy.deepcopy(data)
+            except (sources.httpx.HTTPError, ValueError, TypeError, AttributeError, KeyError) as exc:
+                retry_at = stamp + 3600
+                if isinstance(exc, sources.httpx.HTTPStatusError):
+                    retry = exc.response.headers.get('Retry-After', '')
+                    seconds = finite(retry)
+                    retry_at = max(retry_at, stamp + seconds if seconds is not None else http_time(retry))
+                    reason = f'{provider}: HTTP {exc.response.status_code}'
+                else:
+                    reason = f'{provider}: {type(exc).__name__}: {exc}'
+                # Keep the prior body only for conditional requests after cooldown.
+                entries[provider] = {'retry_at': retry_at, 'reason': reason,
+                    'last_modified': entry.get('last_modified'),
+                    'previous_data': entry.get('data') or entry.get('previous_data')}
+                errors.append(reason)
+                save_cache(key, entries)
+        return {'available': False, 'reason': '; '.join(errors), 'hourly': []}
 
 
 def context_at(time, atmosphere):
@@ -86,7 +219,10 @@ def context_at(time, atmosphere):
     if not rows:
         return result
     row = min(rows, key=lambda row: abs((utc(row['time_utc']) - time).total_seconds()))
-    if abs((utc(row['time_utc']) - time).total_seconds()) > 1800:
+    if not min(utc(r['time_utc']) for r in rows) <= time <= max(utc(r['time_utc']) for r in rows):
+        return result
+    tolerance = atmosphere.get('nearest_tolerance_seconds', 1800)
+    if abs((utc(row['time_utc']) - time).total_seconds()) > tolerance:
         return result
     pressure = finite(row.get('pressure_msl'))
     # Classify the displayed number so a rounded boundary never contradicts its label.
