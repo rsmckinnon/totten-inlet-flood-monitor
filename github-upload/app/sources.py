@@ -2,7 +2,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import asyncio
+import copy
 import csv
+import logging
+import math
+import tempfile
+import time
 import io
 import re
 
@@ -1345,89 +1351,99 @@ def sscofs_candidate_cycles():
     return candidates
 
 
-async def download_sscofs_file():
-    """
-    Find and cache the newest available operational
-    SSCOFS station forecast file.
-    """
+# One small processed forecast per worker; never retain netCDF/NumPy objects.
+SSCOFS_CACHE_TTL_SECONDS = 30 * 60
+SSCOFS_ERROR_TTL_SECONDS = 60
+_sscofs_lock = asyncio.Lock()
+_sscofs_cache = {}
+_log = logging.getLogger(__name__)
 
+
+async def _download_sscofs_to_path(url, path):
+    """Stream to a unique temporary file, then atomically publish it.
+
+    A cancelled or failed transfer cannot leave a partial .nc cache entry.
+    Avoid response.content: the station file is about 47 MB.
+    """
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent, prefix=path.name + ".", suffix=".part", delete=False
+        ) as output:
+            temporary = Path(output.name)
+            async with httpx.AsyncClient(
+                timeout=30.0, follow_redirects=True,
+                headers={"User-Agent": config.NWS_USER_AGENT},
+            ) as client:
+                async with client.stream("GET", url) as response:
+                    response.raise_for_status()
+                    async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
+                        output.write(chunk)
+        if not temporary.stat().st_size:
+            raise OSError("Empty SSCOFS download")
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+async def download_sscofs_file():
+    """Find the newest available cycle, reusing complete files already on disk.
+
+    Called under _sscofs_lock by sscofs(). An explicit SSCOFS_ENDPOINT
+    continues to select a fixed file, as before.
+    """
     if config.SSCOFS_ENDPOINT:
         url = config.SSCOFS_ENDPOINT
+        filename = url.rstrip("/").split("/")[-1]
+        path = CACHE_DIR / filename
+        if not path.exists() or not path.stat().st_size:
+            await _download_sscofs_to_path(url, path)
+        return {"path": path, "filename": filename, "cycle": None}
 
-        filename = (
-            url.rstrip("/")
-            .split("/")[-1]
-        )
-
-        path = (
-            CACHE_DIR /
-            filename
-        )
-
-        if not path.exists():
-            response = await get(url)
-            path.write_bytes(
-                response.content
-            )
-
-        return {
-            "path": path,
-            "filename": filename,
-            "cycle": None,
-        }
-
-    for candidate in (
-        sscofs_candidate_cycles()
-    ):
-        path = (
-            CACHE_DIR /
-            candidate["filename"]
-        )
-
-        if path.exists():
-            return {
-                "path": path,
-                "filename":
-                    candidate[
-                        "filename"
-                    ],
-                "cycle":
-                    candidate[
-                        "cycle"
-                    ],
-            }
-
+    for candidate in sscofs_candidate_cycles():
+        path = CACHE_DIR / candidate["filename"]
         try:
-            response = await get(
-                candidate["url"]
-            )
-
-            path.write_bytes(
-                response.content
-            )
-
-            return {
-                "path": path,
-                "filename":
-                    candidate[
-                        "filename"
-                    ],
-                "cycle":
-                    candidate[
-                        "cycle"
-                    ],
-            }
-
-        except (
-            httpx.HTTPError,
-            OSError,
-        ):
+            if not path.exists() or not path.stat().st_size:
+                await _download_sscofs_to_path(candidate["url"], path)
+            return {"path": path, "filename": candidate["filename"],
+                    "cycle": candidate["cycle"]}
+        except (httpx.HTTPError, OSError):
             continue
+    raise RuntimeError("No recent NOAA SSCOFS forecast file was available.")
 
-    raise RuntimeError(
-        "No recent NOAA SSCOFS "
-        "forecast file was available."
-    )
+
+def _cleanup_sscofs_files(downloaded):
+    """After successful parsing, keep this cycle and its closest predecessor.
+
+    Only older operational station forecasts in our cache are eligible.
+    Preserve custom endpoints, future cycles, other caches and research files.
+    Cleanup failure must not turn a usable forecast into a failed request.
+    """
+    if downloaded["cycle"] is None:
+        return
+    try:
+        older = []
+        for path in CACHE_DIR.glob("sscofs.t*z.*.stations.forecast.nc"):
+            match = re.fullmatch(
+                r"sscofs\.t(03|09|15|21)z\.(\d{8})\.stations\.forecast\.nc",
+                path.name,
+            )
+            if not match or path.is_symlink() or not path.is_file():
+                continue
+            try:
+                cycle = datetime.strptime(
+                    match[2] + match[1], "%Y%m%d%H"
+                ).replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            if cycle < downloaded["cycle"]:
+                older.append((cycle, path))
+        older.sort(reverse=True)
+        for _, path in older[1:]:
+            path.unlink(missing_ok=True)
+    except OSError:
+        _log.warning("Could not clean older SSCOFS cache files", exc_info=True)
 
 
 def decode_station_name(
@@ -1491,228 +1507,279 @@ def decode_station_name(
     return "Totten"
 
 
-async def sscofs():
-    """
-    Retrieve the NOAA SSCOFS station forecast for the
-    Totten Inlet model point and convert model zeta to
-    feet MLLW using the previously validated SSCOFS
-    vertical-datum offset.
-    """
+def _process_sscofs_file(downloaded):
+    """Read only Totten station 93, time, and its station label.
 
-    try:
-        downloaded = (
-            await download_sscofs_file()
+    The Dataset closes even on decoding errors. All arrays and variables
+    are local to this function; only ordinary Python values leave it.
+    """
+    path = downloaded["path"]
+
+    with netCDF4.Dataset(
+        path,
+        "r",
+    ) as dataset:
+
+        station_index = (
+            config.SSCOFS_STATION_INDEX
         )
 
-        path = downloaded["path"]
+        zeta_variable = (
+            dataset.variables["zeta"]
+        )
 
-        with netCDF4.Dataset(
-            path,
-            "r",
-        ) as dataset:
+        time_variable = (
+            dataset.variables["time"]
+        )
 
-            station_index = (
-                config.SSCOFS_STATION_INDEX
+        # Bound the HDF5 per-variable chunk cache on small Render workers.
+        zeta_variable.set_var_chunk_cache(1024 * 1024, 1009, 0.75)
+
+        raw_levels = (
+            zeta_variable[
+                :,
+                station_index
+            ]
+        )
+
+        converted_times = (
+            netCDF4.num2date(
+                time_variable[:],
+                units=
+                    time_variable.units,
+                calendar=getattr(
+                    time_variable,
+                    "calendar",
+                    "standard",
+                ),
+                only_use_cftime_datetimes=False,
+                only_use_python_datetimes=True,
             )
+        )
 
-            zeta_variable = (
-                dataset.variables["zeta"]
-            )
+        times = []
 
-            time_variable = (
-                dataset.variables["time"]
-            )
+        levels = []
 
-            raw_levels = (
-                zeta_variable[
-                    :,
-                    station_index
-                ]
-            )
-
-            converted_times = (
-                netCDF4.num2date(
-                    time_variable[:],
-                    units=
-                        time_variable.units,
-                    calendar=getattr(
-                        time_variable,
-                        "calendar",
-                        "standard",
-                    ),
-                    only_use_cftime_datetimes=False,
-                    only_use_python_datetimes=True,
-                )
-            )
-
-            times = []
-
-            levels = []
-
-            for raw_time, raw_level in zip(
-                converted_times,
-                raw_levels,
-            ):
-                if (
-                    hasattr(
-                        raw_level,
-                        "mask",
-                    )
-                    and raw_level.mask
-                ):
-                    continue
-
-                try:
-                    level_m = float(
-                        raw_level
-                    )
-                except (
-                    TypeError,
-                    ValueError,
-                ):
-                    continue
-
-                if raw_time.tzinfo is None:
-                    time_utc = (
-                        raw_time.replace(
-                            tzinfo=timezone.utc
-                        )
-                    )
-                else:
-                    time_utc = (
-                        raw_time.astimezone(
-                            timezone.utc
-                        )
-                    )
-
-                # mllwtomsl is MLLW relative to MSL.
-                #
-                # Totten:
-                #     -2.526926 m
-                #
-                # MLLW height =
-                #     model zeta - mllwtomsl
-                #
-                level_mllw_m = (
-                    level_m -
-                    config.SSCOFS_MLLW_TO_MSL_M
-                )
-
-                level_mllw_ft = (
-                    level_mllw_m *
-                    3.28084
-                )
-
-                times.append(
-                    time_utc
-                )
-
-                levels.append(
-                    level_mllw_ft
-                )
-
-            if not levels:
-                raise RuntimeError(
-                    "SSCOFS file contained "
-                    "no usable Totten water "
-                    "levels."
-                )
-
-            peak_index = max(
-                range(len(levels)),
-                key=lambda i:
-                    levels[i],
-            )
-
-            peaks = (
-                find_water_level_peaks(
-                    times,
-                    levels,
-                )
-            )
-
-            station_name = "Totten"
-
+        for raw_time, raw_level in zip(
+            converted_times,
+            raw_levels,
+        ):
             if (
-                "station_name"
-                in dataset.variables
+                hasattr(
+                    raw_level,
+                    "mask",
+                )
+                and raw_level.mask
             ):
-                station_name = (
-                    decode_station_name(
-                        dataset.variables[
-                            "station_name"
-                        ],
-                        station_index,
+                continue
+
+            try:
+                level_m = float(
+                    raw_level
+                )
+            except (
+                TypeError,
+                ValueError,
+            ):
+                continue
+
+            if not math.isfinite(level_m):
+                continue
+
+            if raw_time.tzinfo is None:
+                time_utc = (
+                    raw_time.replace(
+                        tzinfo=timezone.utc
+                    )
+                )
+            else:
+                time_utc = (
+                    raw_time.astimezone(
+                        timezone.utc
                     )
                 )
 
-        peak_level = levels[
-            peak_index
-        ]
+            # mllwtomsl is MLLW relative to MSL.
+            #
+            # Totten:
+            #     -2.526926 m
+            #
+            # MLLW height =
+            #     model zeta - mllwtomsl
+            #
+            level_mllw_m = (
+                level_m -
+                config.SSCOFS_MLLW_TO_MSL_M
+            )
 
-        peak_time = times[
-            peak_index
-        ]
+            level_mllw_ft = (
+                level_mllw_m *
+                3.28084
+            )
 
-        threshold = (
-            config.PROPERTY_FLOOD_THRESHOLD_FT
+            times.append(
+                time_utc
+            )
+
+            levels.append(
+                level_mllw_ft
+            )
+
+        if not levels:
+            raise RuntimeError(
+                "SSCOFS file contained "
+                "no usable Totten water "
+                "levels."
+            )
+
+        peak_index = max(
+            range(len(levels)),
+            key=lambda i:
+                levels[i],
         )
 
-        margin = None
+        peaks = (
+            find_water_level_peaks(
+                times,
+                levels,
+            )
+        )
 
-        if threshold is not None:
-            margin = (
-                peak_level -
-                threshold
+        station_name = "Totten"
+
+        if (
+            "station_name"
+            in dataset.variables
+        ):
+            station_name = (
+                decode_station_name(
+                    dataset.variables[
+                        "station_name"
+                    ],
+                    station_index,
+                )
             )
 
-        cycle = downloaded[
-            "cycle"
-        ]
+    peak_level = levels[
+        peak_index
+    ]
 
-        cycle_text = None
+    peak_time = times[
+        peak_index
+    ]
 
-        if cycle is not None:
-            cycle_text = (
-                cycle.isoformat()
-            )
+    threshold = (
+        config.PROPERTY_FLOOD_THRESHOLD_FT
+    )
 
-        return {
-            "available": True,
-            "forecast_start_utc": min(times).isoformat(),
-            "forecast_end_utc": max(times).isoformat(),
-            "station":
-                station_name,
-            "station_index":
-                config.SSCOFS_STATION_INDEX,
-            "cycle_utc":
-                cycle_text,
-            "file":
-                downloaded[
-                    "filename"
-                ],
-            "peak_time_utc":
-                peak_time.isoformat(),
-            "peak_mllw_ft":
-                round(
-                    peak_level,
-                    2,
-                ),
-            "peaks":
-                peaks,
-            "threshold_ft":
-                threshold,
-            "margin_ft":
-                None
-                if margin is None
-                else round(
-                    margin,
-                    2,
-                ),
-        }
+    margin = None
 
-    except Exception as exc:
-        return {
-            "available": False,
-            "reason": str(exc),
-        }
+    if threshold is not None:
+        margin = (
+            peak_level -
+            threshold
+        )
+
+    cycle = downloaded[
+        "cycle"
+    ]
+
+    cycle_text = None
+
+    if cycle is not None:
+        cycle_text = (
+            cycle.isoformat()
+        )
+
+    return {
+        "available": True,
+        "forecast_start_utc": min(times).isoformat(),
+        "forecast_end_utc": max(times).isoformat(),
+        "station":
+            station_name,
+        "station_index":
+            config.SSCOFS_STATION_INDEX,
+        "cycle_utc":
+            cycle_text,
+        "file":
+            downloaded[
+                "filename"
+            ],
+        "peak_time_utc":
+            peak_time.isoformat(),
+        "peak_mllw_ft":
+            round(
+                peak_level,
+                2,
+            ),
+        "peaks":
+            peaks,
+        "threshold_ft":
+            threshold,
+        "margin_ft":
+            None
+            if margin is None
+            else round(
+                margin,
+                2,
+            ),
+    }
+
+
+def _sscofs_config_key():
+    return (config.SSCOFS_ENDPOINT, config.SSCOFS_NOMADS_BASE,
+            config.SSCOFS_STATION_INDEX, config.SSCOFS_MLLW_TO_MSL_M,
+            config.PROPERTY_FLOOD_THRESHOLD_FT)
+
+
+async def sscofs():
+    """Share a processed forecast for 30 minutes, then look for a newer cycle.
+
+    The async lock covers discovery, download, processing and cache updates.
+    Waiting requests recheck the cache inside the lock. An unchanged file
+    reuses its processed result even after TTL expiry. Failures are briefly
+    cached to avoid a retry storm; expired forecasts are never served as live.
+    """
+    async with _sscofs_lock:
+        key = _sscofs_config_key()
+        if _sscofs_cache.get("key") != key:
+            _sscofs_cache.clear()
+            _sscofs_cache["key"] = key
+        if time.monotonic() < _sscofs_cache.get("expires_at", 0):
+            return copy.deepcopy(_sscofs_cache["result"])
+        downloaded = None
+        processing = False
+        try:
+            downloaded = await download_sscofs_file()
+            stat = downloaded["path"].stat()
+            identity = (str(downloaded["path"].resolve()), stat.st_size,
+                        stat.st_mtime_ns)
+            if identity == _sscofs_cache.get("identity"):
+                result = _sscofs_cache["processed"]
+            else:
+                processing = True
+                result = _process_sscofs_file(downloaded)
+                processing = False
+                _sscofs_cache.update(identity=identity, processed=result)
+                _log.info("SSCOFS processed %s for station %s",
+                          downloaded["filename"], config.SSCOFS_STATION_INDEX)
+            remaining = (datetime.fromisoformat(result["forecast_end_utc"])
+                         - datetime.now(timezone.utc)).total_seconds()
+            if remaining <= 0:
+                raise RuntimeError("SSCOFS forecast coverage has expired.")
+            ttl = min(SSCOFS_CACHE_TTL_SECONDS, remaining)
+            _cleanup_sscofs_files(downloaded)
+        except Exception as exc:
+            # Re-download an unreadable file on the next attempt. Do not
+            # discard valid files simply because their forecast has expired.
+            if processing and downloaded is not None:
+                try:
+                    downloaded["path"].unlink(missing_ok=True)
+                except OSError:
+                    pass
+            result = {"available": False, "reason": str(exc)}
+            ttl = SSCOFS_ERROR_TTL_SECONDS
+            _log.warning("SSCOFS unavailable: %s", exc)
+        _sscofs_cache.update(result=result, expires_at=time.monotonic() + ttl)
+        return copy.deepcopy(result)
