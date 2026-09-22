@@ -2,9 +2,11 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
 from . import config, sources, risk, outlook
+from .observations import router as observations_router
 
 
 app = FastAPI(title="Totten Inlet Flood Monitor")
+app.include_router(observations_router)
 
 
 @app.get("/api/data")
@@ -433,6 +435,100 @@ summary {
 
 </div>
 
+
+<div class="card" style="margin-top:14px">
+<details id="local-observations">
+<summary>Local Tide Observations</summary>
+<p>Piling gauge — 0 inches = property flood-entry threshold. Negative readings are below the threshold; positive readings are above it.</p>
+<p id="observation-status" role="status" aria-live="polite">Expand to check observation storage.</p>
+<form id="observation-form">
+<fieldset id="observation-fields" disabled style="border:0;padding:0">
+<label for="observation-time">Observation date/time</label>
+<input id="observation-time" type="datetime-local" required>
+<small id="observation-timezone"></small>
+<label for="observation-reading">Gauge reading (inches)</label>
+<input id="observation-reading" type="number" step="0.0001" min="-1200" max="1200" placeholder="−18.5" required>
+<label for="observation-note">Note (optional; visible on this dashboard)</label>
+<textarea id="observation-note" maxlength="2000" rows="2"></textarea>
+<label for="observation-key">Observation access key</label>
+<input id="observation-key" type="password" autocomplete="off" required>
+<small>The key allows you to save readings. It is kept only while this page is open.</small>
+<p><button id="observation-save" type="submit">Save observation</button></p>
+</fieldset>
+</form>
+<button id="observation-refresh" type="button">Refresh observations</button>
+<h3>Recent observations</h3>
+<ul id="observation-list"></ul>
+</details>
+</div>
+<style>
+#observation-form label {display:block;margin-top:12px;font-weight:600}
+#observation-form input, #observation-form textarea {box-sizing:border-box;width:100%;max-width:480px;display:block;padding:8px;font:inherit}
+#observation-form small {display:block;margin-top:4px}
+#observation-list {padding-left:20px}
+#observation-list li {margin-bottom:8px;white-space:pre-wrap;overflow-wrap:anywhere}
+#local-observations button:disabled {opacity:.5;cursor:default}
+</style>
+<script>
+(() => {
+ const byId = id => document.getElementById(id);
+ const status = byId('observation-status');
+ const time = byId('observation-time');
+ const fields = byId('observation-fields');
+ let pending = null, busy = false;
+ function currentTime() {
+   const d = new Date();
+   time.value = new Date(d.getTime() - d.getTimezoneOffset()*60000).toISOString().slice(0,16);
+ }
+ async function responseData(response) {
+   let data;
+   try { data = await response.json(); } catch { throw new Error('Storage could not be reached. Keep your entry and retry.'); }
+   if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Check the date, reading and note, then retry.');
+   return data;
+ }
+ async function refresh() {
+   if (busy) return;
+   byId('observation-refresh').disabled = true;
+   try {
+     const data = await responseData(await fetch('/api/observations', {cache:'no-store'}));
+     fields.disabled = false;
+     status.textContent = 'Persistent observation storage is connected.';
+     const list = byId('observation-list'); list.replaceChildren();
+     if (!data.observations.length) { const li = document.createElement('li'); li.textContent = 'No observations yet.'; list.append(li); }
+     for (const row of data.observations) {
+       const li = document.createElement('li');
+       const reading = Number(row.reading_inches);
+       li.textContent = new Date(row.observed_at).toLocaleString() + ' · ' + (reading > 0 ? '+' : '') + reading + ' in' + (row.note ? ' — ' + row.note : '');
+       li.title = 'Submitted: ' + new Date(row.submitted_at).toLocaleString();
+       list.append(li);
+     }
+   } catch (error) { fields.disabled = true; status.textContent = error.message; }
+   finally { byId('observation-refresh').disabled = false; }
+ }
+ byId('local-observations').addEventListener('toggle', () => {
+   if (byId('local-observations').open) { if (!time.value) currentTime(); refresh(); }
+ });
+ byId('observation-timezone').textContent = 'Time zone: ' + Intl.DateTimeFormat().resolvedOptions().timeZone + ' (this device).';
+ byId('observation-refresh').addEventListener('click', refresh);
+ byId('observation-form').addEventListener('submit', async event => {
+   event.preventDefault(); if (busy) return;
+   const date = new Date(time.value);
+   if (!Number.isFinite(date.getTime()) || date.getTime() > Date.now()+300000) { status.textContent = 'Choose a valid observation time that is not in the future.'; return; }
+   const payload = {observed_at:date.toISOString(), reading_inches:byId('observation-reading').value, note:byId('observation-note').value};
+   const signature = JSON.stringify(payload);
+   if (!pending || pending.signature !== signature) pending = {signature, id:crypto.randomUUID()};
+   busy = true; byId('observation-save').disabled = true;
+   status.textContent = 'Saving observation…';
+   try {
+     await responseData(await fetch('/api/observations', {method:'POST',headers:{'Content-Type':'application/json','X-Observations-Key':byId('observation-key').value},body:JSON.stringify({...payload,id:pending.id})}));
+     pending = null; byId('observation-reading').value = ''; byId('observation-note').value = ''; currentTime();
+     busy = false; await refresh();
+     status.textContent = fields.disabled ? 'Observation saved. Recent list could not be refreshed; try Refresh observations.' : 'Observation saved to persistent storage.';
+   } catch(error) { status.textContent = error.message + ' Your entry is still in the form.'; }
+   finally { busy = false; byId('observation-save').disabled = false; }
+ });
+})();
+</script>
 
 <div class="card" style="margin-top:14px">
     <h2>Forecast updated</h2>
