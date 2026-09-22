@@ -24,3 +24,7 @@ The public risk tile and API expose the configured flooding threshold.
 ## Local tests
 
 `python -m unittest discover -s tests -v`
+
+## Permanent local tide observations
+
+See [OBSERVATIONS_SETUP.md](OBSERVATIONS_SETUP.md) for the required external PostgreSQL setup. Saving stays disabled until configured.
