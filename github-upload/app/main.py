@@ -364,7 +364,9 @@ summary {
 
 <div class="card" style="margin-top:14px">
 
-    <h2>Upcoming High-Water Periods</h2>
+    <details id="high-water-panel">
+    <summary>Upcoming High-Water Periods</summary>
+    <div style="margin-top:14px">
 
     <div
         id="high-water-unavailable"
@@ -378,15 +380,17 @@ summary {
     <div class="table-wrap">
         <table id="high-water-events"></table>
     </div>
+    </div>
+    </details>
 
 </div>
 
 
 <div class="card" style="margin-top:14px">
 
-    <h2>
-        Weather and Rainfall
-    </h2>
+    <details id="weather-panel">
+    <summary>Weather and Rainfall</summary>
+    <div style="margin-top:14px">
 
     <div class="rain-summary">
 
@@ -432,6 +436,8 @@ summary {
     <div class="table-wrap">
         <table id="weather"></table>
     </div>
+    </div>
+    </details>
 
 </div>
 
