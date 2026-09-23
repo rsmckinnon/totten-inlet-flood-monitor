@@ -537,12 +537,6 @@ summary {
 </script>
 
 <div class="card" style="margin-top:14px">
-    <h2>Forecast updated</h2>
-    <strong id="model-cycle">—</strong>
-</div>
-
-
-<div class="card" style="margin-top:14px">
 
     <details>
 
@@ -627,6 +621,12 @@ summary {
         </div>
 
     </details>
+</div>
+
+
+<div class="card" style="margin-top:14px">
+    <h2>Forecast updated</h2>
+    <strong id="model-cycle">—</strong>
 </div>
 
 
