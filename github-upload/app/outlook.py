@@ -258,14 +258,14 @@ def build_events(tides, model, atmosphere, now=None, king_dates=None):
     if model.get('available') and start_model and end_model:
         peaks = [p for p in model.get('peaks', [])
                  if utc(p.get('time_utc')) is not None and finite(p.get('mllw_ft')) is not None
-                 and max(now, start_model) <= utc(p['time_utc']) <= end_model]
+                 and start_model <= utc(p['time_utc']) <= end_model]
     paired = sources.pair_high_water_events(tides, peaks)
     by_tide = {event['arcadia_time']: event for event in paired}
     events, seen = [], set()
     for tide in tides:
         time = sources.parse_arcadia_time(tide.get('t'))
         height = finite(tide.get('v'))
-        if tide.get('type') != 'H' or time is None or height is None or not now <= time <= end:
+        if tide.get('type') != 'H' or time is None or height is None or time > end:
             continue
         if time in seen:
             continue
@@ -277,7 +277,12 @@ def build_events(tides, model, atmosphere, now=None, king_dates=None):
         if start_model and end_model and start_model <= time <= end_model and tide['t'] in by_tide:
             event.update(by_tide[tide['t']])
             event['kind'] = 'forecast'
+        # Keep the pair intact until both the astronomical tide and modeled
+        # peak have passed. Filtering peaks at 'now' erased a valid height
+        # during the gap between these two predictions.
         event_time = utc(event['sscofs_time_utc']) or time
+        if max(time, event_time) < now:
+            continue
         event['event_time_utc'] = event_time.isoformat()
         event['king_tide'] = time.astimezone(sources.PACIFIC).date().isoformat() in king_dates
         event.update(context_at(event_time, atmosphere))
