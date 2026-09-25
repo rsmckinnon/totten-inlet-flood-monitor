@@ -37,6 +37,27 @@ class OutlookTests(unittest.TestCase):
         self.assertEqual([r['sscofs_mllw_ft'] for r in rows],[15.4]*3+[None]*3)
         self.assertEqual(rows[3]['kind'],'outlook')
 
+    def test_pair_survives_between_peak_and_tide(self):
+        for offset in (-20, 20):
+            with self.subTest(model_offset_minutes=offset):
+                tide_time = NOW + timedelta(hours=12)
+                peak_time = tide_time + timedelta(minutes=offset)
+                forecast = model()
+                forecast['peaks'] = [{'time_utc': peak_time.isoformat(), 'mllw_ft': 15.4}]
+                first, last = sorted((tide_time, peak_time))
+                for current in (first - timedelta(minutes=1), first + timedelta(minutes=1), last):
+                    rows = outlook.build_events([tide(tide_time)], forecast, {}, now=current)
+                    self.assertEqual(len(rows), 1)
+                    self.assertEqual(rows[0]['sscofs_mllw_ft'], 15.4)
+                    self.assertEqual(rows[0]['sscofs_time_utc'], peak_time.isoformat())
+                    self.assertEqual(rows[0]['kind'], 'forecast')
+                self.assertEqual(outlook.build_events([tide(tide_time)], forecast, {},
+                                 now=last + timedelta(seconds=1)), [])
+
+    def test_past_unpaired_tide_stays_hidden(self):
+        self.assertEqual(outlook.build_events([tide(NOW-timedelta(minutes=1))],
+                         {'available':False}, {}, now=NOW), [])
+
     def test_missing_model_and_duplicates(self):
         t=tide(NOW+timedelta(days=1))
         rows=outlook.build_events([t,t],{'available':False},{},now=NOW)
